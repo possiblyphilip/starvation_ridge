@@ -9,6 +9,7 @@ import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanRecord
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
@@ -21,11 +22,14 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.starvationridge.pit.R
 import com.starvationridge.pit.RidgeApp
+import com.starvationridge.pit.engine.AdvertisementParser
+import com.starvationridge.pit.engine.BeaconSighting
 import com.starvationridge.pit.engine.IBeaconParser
 import com.starvationridge.pit.engine.RaceRepository
 import com.starvationridge.pit.ui.MainActivity
@@ -36,12 +40,30 @@ class ScanService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var scanning = false
     private var running = false
+    private val loggedBeacons = HashSet<String>()
+
+    @Volatile
+    private var lastResultAt = 0L
 
     private val tick = object : Runnable {
         override fun run() {
             if (!running) return
             repository.tick(System.currentTimeMillis())
             handler.postDelayed(this, TICK_MS)
+        }
+    }
+
+    private val watchScan = object : Runnable {
+        override fun run() {
+            if (!running) return
+            val now = System.currentTimeMillis()
+            val silentFor = if (lastResultAt == 0L) 0L else now - lastResultAt
+            val runningFor = if (scanStartedAt == 0L) 0L else now - scanStartedAt
+            if (silentFor > SILENT_RESTART_MS || runningFor > RESTART_EVERY_MS) {
+                Log.i(TAG, "restarting scan, silent ${silentFor}ms, up ${runningFor}ms")
+                startScan()
+            }
+            handler.postDelayed(this, WATCH_MS)
         }
     }
 
@@ -60,15 +82,35 @@ class ScanService : Service() {
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            lastResultAt = System.currentTimeMillis()
             val record = result.scanRecord ?: return
-            val data = record.manufacturerSpecificData ?: return
-            val seenAt = System.currentTimeMillis()
-            for (index in 0 until data.size()) {
-                val bytes = data.valueAt(index) ?: continue
-                val beacon = IBeaconParser.parse(data.keyAt(index), bytes) ?: continue
-                handler.post {
-                    repository.noteBeacon(beacon.uuid, beacon.major, beacon.minor, result.rssi, seenAt)
+            val mac = try {
+                result.device.address ?: return
+            } catch (_: SecurityException) {
+                return
+            }
+            val sighting = AdvertisementParser.parse(record.bytes) ?: sightingFromRecord(record) ?: return
+            val advertisedName = sighting.name.ifBlank {
+                try {
+                    record.deviceName ?: ""
+                } catch (_: SecurityException) {
+                    ""
                 }
+            }
+            if (loggedBeacons.add("beacon:$mac")) {
+                Log.i(TAG, "beacon mac=$mac name=$advertisedName uuid=${sighting.uuid} rssi=${result.rssi}")
+            }
+            val seenAt = System.currentTimeMillis()
+            handler.post {
+                repository.noteBeacon(
+                    mac,
+                    advertisedName,
+                    sighting.uuid,
+                    sighting.major,
+                    sighting.minor,
+                    result.rssi,
+                    seenAt,
+                )
             }
         }
 
@@ -98,6 +140,7 @@ class ScanService : Service() {
             running = true
             acquireWakeLock()
             handler.post(tick)
+            handler.post(watchScan)
         }
         startScan()
         return START_STICKY
@@ -121,7 +164,14 @@ class ScanService : Service() {
             this,
             NOTIFICATION_ID,
             notification,
-            if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0,
+            if (Build.VERSION.SDK_INT >= 34) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            } else if (Build.VERSION.SDK_INT >= 29) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            } else {
+                0
+            },
         )
     }
 
@@ -147,6 +197,9 @@ class ScanService : Service() {
         try {
             scanner.startScan(null, settings, scanCallback)
             scanning = true
+            val started = System.currentTimeMillis()
+            scanStartedAt = started
+            lastResultAt = started
             repository.setStatus(null)
         } catch (_: SecurityException) {
             repository.setStatus("Allow Bluetooth to hear the bike")
@@ -166,13 +219,51 @@ class ScanService : Service() {
         scanning = false
     }
 
-    private fun hasScanPermission(): Boolean {
-        val permission = if (Build.VERSION.SDK_INT >= 31) {
-            Manifest.permission.BLUETOOTH_SCAN
-        } else {
-            Manifest.permission.ACCESS_FINE_LOCATION
+    private fun sightingFromRecord(record: ScanRecord): BeaconSighting? {
+        var serviceHit = record.serviceUuids.orEmpty().any { parcel ->
+            parcel.uuid.toString().startsWith("00002080")
         }
-        return ContextCompat.checkSelfPermission(this, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val eddystoneFrames = setOf(0x00, 0x10, 0x20, 0x21, 0x22, 0x30)
+        for ((parcel, bytes) in record.serviceData.orEmpty()) {
+            val uuid = parcel.uuid.toString()
+            if (uuid.startsWith("00002080")) serviceHit = true
+            if (uuid.startsWith("0000feaa") && bytes.isNotEmpty() && (bytes[0].toInt() and 0xFF) in eddystoneFrames) {
+                serviceHit = true
+            }
+        }
+        var uuid = ""
+        var major = -1
+        var minor = -1
+        var kkm = false
+        val data = record.manufacturerSpecificData
+        if (data != null) {
+            for (index in 0 until data.size()) {
+                val companyId = data.keyAt(index)
+                val bytes = data.valueAt(index) ?: continue
+                val ibeacon = IBeaconParser.parse(companyId, bytes)
+                if (ibeacon != null) {
+                    uuid = ibeacon.uuid
+                    major = ibeacon.major
+                    minor = ibeacon.minor
+                }
+                if (companyId == IBeaconParser.KKM_COMPANY_ID) kkm = true
+            }
+        }
+        val name = record.deviceName ?: ""
+        val named = name.uppercase().let { it.startsWith("KB") || it.startsWith("BC") || it.contains("BEACON") }
+        if (uuid.isBlank() && !kkm && !serviceHit && !named) return null
+        return BeaconSighting(name, uuid, major, minor)
+    }
+
+    private fun hasScanPermission(): Boolean {
+        val permissions = if (Build.VERSION.SDK_INT >= 31) {
+            listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.ACCESS_FINE_LOCATION)
+        } else {
+            listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        return permissions.all { permission ->
+            ContextCompat.checkSelfPermission(this, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
     }
 
     private fun acquireWakeLock() {
@@ -208,9 +299,15 @@ class ScanService : Service() {
     }
 
     companion object {
+        private const val TAG = "PitScan"
         private const val CHANNEL_ID = "pit-scan"
         private const val NOTIFICATION_ID = 7
         private const val TICK_MS = 500L
         private const val RETRY_MS = 3_000L
+        private const val WATCH_MS = 5_000L
+        private const val SILENT_RESTART_MS = 12_000L
+        private const val RESTART_EVERY_MS = 120_000L
+
+        private var scanStartedAt = 0L
     }
 }

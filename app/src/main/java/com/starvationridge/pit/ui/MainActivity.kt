@@ -108,7 +108,11 @@ class MainActivity : ComponentActivity() {
 
     private fun requiredBluetoothPermissions(): List<String> {
         return if (Build.VERSION.SDK_INT >= 31) {
-            listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+            listOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+            )
         } else {
             listOf(Manifest.permission.ACCESS_FINE_LOCATION)
         }

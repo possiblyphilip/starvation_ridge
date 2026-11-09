@@ -51,6 +51,18 @@ class RaceEngineTest {
     }
 
     @Test
+    fun aSlowBeaconStillCountsOnceItIsHeardTwice() {
+        val engine = riding(minLapMs = 0)
+        val first = engine.state.rideStartedAtMs!! + 5_000
+        engine.sample(-40, first)
+        engine.tick(first + 3_000)
+        assertEquals(Phase.OnCourse, engine.state.phase)
+
+        engine.sample(-40, first + 7_000)
+        assertEquals(Phase.InPit, engine.state.phase)
+    }
+
+    @Test
     fun arrivalInsideTheMinimumLapIsRejected() {
         val engine = riding(minLapMs = 30L * 60L * 1000L)
         val rideStart = engine.state.rideStartedAtMs!!
@@ -163,6 +175,34 @@ class RaceEngineTest {
     }
 
     @Test
+    fun manualArriveWithoutABeaconKeepsThePitOpen() {
+        val engine = RaceEngine(RaceState(settings = RaceSettings(minLapMs = 0)))
+        engine.start(0)
+        engine.tick(RaceEngine.STAGING_GRACE_MS)
+        engine.manualArrive(20_000)
+        engine.tick(80_000)
+
+        assertEquals(Phase.InPit, engine.state.phase)
+        assertEquals(1, engine.displayedLap())
+        assertNull(engine.state.laps.single().pitDurationMs)
+        assertEquals(60_000L, engine.pitElapsed(80_000))
+    }
+
+    @Test
+    fun pitEndsOnceTheBeaconWasHeardAndThenGoesQuiet() {
+        val engine = riding(minLapMs = 0)
+        val rideStart = engine.state.rideStartedAtMs!!
+        engine.manualArrive(rideStart + 1_000)
+        val heard = hold(engine, rideStart + 2_000, rssi = -50, until = rideStart + 3_000)
+        engine.tick(heard + RaceEngine.FRESH_MS + 1)
+        engine.tick(heard + 15_000)
+
+        assertEquals(Phase.OnCourse, engine.state.phase)
+        assertEquals(2, engine.displayedLap())
+        assertEquals(heard + 15_000 - (rideStart + 1_000), engine.state.laps.single().pitDurationMs)
+    }
+
+    @Test
     fun manualArriveAndLeaveBypassTheRadioAndTheLockout() {
         val engine = riding(minLapMs = 30L * 60L * 1000L)
         val rideStart = engine.state.rideStartedAtMs!!
@@ -261,6 +301,48 @@ class RaceEngineTest {
         assertEquals(60L * 60L * 1000L, secondOneThirty - firstOneThirty)
         assertEquals(60L * 60L * 1000L, engine.state.laps.single().rideDurationMs)
         assertEquals("1:00:00", formatDuration(engine.state.laps.single().rideDurationMs))
+    }
+
+    @Test
+    fun finishFreezesTheRaceClockUntilUndo() {
+        val engine = RaceEngine()
+        engine.start(1_000)
+        engine.tick(1_000 + RaceEngine.STAGING_GRACE_MS)
+        assertEquals("Race clock stopped at 0:01:30.", engine.finish(91_000))
+        engine.tick(201_000)
+        assertEquals("Race clock is already stopped", engine.manualArrive(201_000))
+
+        assertEquals(90_000L, engine.raceElapsed(201_000))
+        assertTrue(engine.state.laps.isEmpty())
+        assertEquals("Undid the last change. Lap 1.", engine.undo(201_000))
+        assertNull(engine.state.raceFinishedAtMs)
+        assertEquals(200_000L, engine.raceElapsed(201_000))
+    }
+
+    @Test
+    fun resetClearsTheRaceAndKeepsTheBeacon() {
+        val engine = riding(minLapMs = 0)
+        engine.updateSettings(engine.state.settings.copy(beaconUuid = "ABC", beaconMajor = 1, beaconMinor = 2))
+        val rideStart = engine.state.rideStartedAtMs!!
+        engine.manualArrive(rideStart + 1_000)
+        engine.finish(rideStart + 2_000)
+
+        assertEquals("Race cleared. Beacon setup kept.", engine.reset())
+        assertEquals(Phase.NotStarted, engine.state.phase)
+        assertTrue(engine.state.laps.isEmpty())
+        assertNull(engine.state.raceStartedAtMs)
+        assertNull(engine.state.raceFinishedAtMs)
+        assertEquals("ABC", engine.state.settings.beaconUuid)
+        assertEquals(1, engine.state.settings.beaconMajor)
+        assertEquals("Nothing to undo", engine.undo(0))
+    }
+
+    @Test
+    fun repeatedArriveSaysYouAreAlreadyInThePit() {
+        val engine = riding(minLapMs = 0)
+        val rideStart = engine.state.rideStartedAtMs!!
+        assertTrue(engine.manualArrive(rideStart + 1_000).startsWith("Arrived."))
+        assertEquals("Already in the pit. Lap 1.", engine.manualArrive(rideStart + 2_000))
     }
 
     @Test

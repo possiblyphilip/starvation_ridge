@@ -5,6 +5,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,10 +21,13 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -37,14 +41,20 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.starvationridge.pit.engine.RaceRepository
 import com.starvationridge.pit.engine.SeenBeacon
+import com.starvationridge.pit.engine.formatDuration
+import com.starvationridge.pit.engine.lapLogNewestFirst
+import com.starvationridge.pit.engine.raceElapsedOf
 
-private val Amber = Color(0xFFFFB300)
+private val Amber = Color(0xFFFF6600)
 private val Dim = Color(0xFFB0B0B0)
 
 @Composable
 fun SettingsScreen(repository: RaceRepository, onClose: () -> Unit) {
     val state by repository.state.collectAsStateWithLifecycle()
     val seen by repository.seen.collectAsStateWithLifecycle()
+    val notice by repository.notice.collectAsStateWithLifecycle()
+    var confirmStop by remember { mutableStateOf(false) }
+    var confirmReset by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var batteryOk by remember { mutableStateOf(isBatteryUnrestricted(context)) }
@@ -57,9 +67,16 @@ fun SettingsScreen(repository: RaceRepository, onClose: () -> Unit) {
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    val selected = seen.firstOrNull { beacon ->
-        repository.matches(beacon.uuid, beacon.major, beacon.minor)
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            now = System.currentTimeMillis()
+            delay(500)
+        }
     }
+    val selected = seen.firstOrNull { beacon ->
+        repository.matches(beacon.mac, beacon.uuid, beacon.major, beacon.minor)
+    }?.takeIf { now - it.seenAtMs <= 12_000L }
     MaterialTheme(colorScheme = darkColorScheme(primary = Amber, onPrimary = Color.Black)) {
         Column(
             modifier = Modifier
@@ -132,27 +149,144 @@ fun SettingsScreen(repository: RaceRepository, onClose: () -> Unit) {
 
             Text("Beacons", color = Color.White, fontSize = 22.sp)
             if (seen.isEmpty()) {
-                Text("No beacons yet. Bring the bike to the truck.", color = Dim, fontSize = 16.sp)
+                Text(
+                    "No beacons yet. In the KBeacon app, turn the motion trigger off and set one iBeacon slot to advertise all the time, then leave that beacon's screen. A connected beacon stops advertising.",
+                    color = Dim,
+                    fontSize = 16.sp,
+                )
             } else {
                 seen.forEach { beacon ->
                     BeaconRow(
                         beacon = beacon,
-                        selected = repository.matches(beacon.uuid, beacon.major, beacon.minor),
-                        onClick = { repository.selectBeacon(beacon.uuid, beacon.major, beacon.minor) },
+                        selected = repository.matches(beacon.mac, beacon.uuid, beacon.major, beacon.minor),
+                        onClick = {
+                            repository.selectBeacon(beacon.mac, beacon.uuid, beacon.major, beacon.minor)
+                        },
                     )
                 }
             }
 
             Text("If a pass is missed", color = Color.White, fontSize = 22.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(onClick = { repository.manualArrive(System.currentTimeMillis()) }, modifier = Modifier.weight(1f)) {
-                    Text("Arrived")
+                Button(
+                    onClick = {
+                        confirmStop = false
+                        confirmReset = false
+                        repository.manualArrive(System.currentTimeMillis())
+                    },
+                    modifier = Modifier.weight(1f).height(72.dp),
+                ) {
+                    Text("Arrived", fontSize = 18.sp)
                 }
-                Button(onClick = { repository.manualLeave(System.currentTimeMillis()) }, modifier = Modifier.weight(1f)) {
-                    Text("Left")
+                Button(
+                    onClick = {
+                        confirmStop = false
+                        confirmReset = false
+                        repository.manualLeave(System.currentTimeMillis())
+                    },
+                    modifier = Modifier.weight(1f).height(72.dp),
+                ) {
+                    Text("Left", fontSize = 18.sp)
                 }
-                Button(onClick = { repository.undo(System.currentTimeMillis()) }, modifier = Modifier.weight(1f)) {
-                    Text("Undo")
+                Button(
+                    onClick = {
+                        confirmStop = false
+                        confirmReset = false
+                        repository.undo(System.currentTimeMillis())
+                    },
+                    modifier = Modifier.weight(1f).height(72.dp),
+                ) {
+                    Text("Undo", fontSize = 18.sp)
+                }
+            }
+            notice?.let { message ->
+                Text(
+                    text = message,
+                    color = Color.Black,
+                    fontSize = 22.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Amber)
+                        .padding(16.dp),
+                )
+            }
+            val finishedAt = state.raceFinishedAtMs
+            if (finishedAt != null) {
+                Text(
+                    text = "Race clock is stopped at ${formatDuration(raceElapsedOf(state, finishedAt))}.",
+                    color = Color.White,
+                    fontSize = 20.sp,
+                )
+            } else if (state.raceStartedAtMs != null) {
+                Button(
+                    onClick = {
+                        confirmReset = false
+                        if (confirmStop) {
+                            repository.finish(System.currentTimeMillis())
+                            confirmStop = false
+                        } else {
+                            confirmStop = true
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().height(72.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (confirmStop) Amber else Color(0xFF333333),
+                        contentColor = if (confirmStop) Color.Black else Color.White,
+                    ),
+                ) {
+                    Text(
+                        if (confirmStop) "Tap again to stop the clock" else "Stop race clock",
+                        fontSize = 20.sp,
+                    )
+                }
+                if (confirmStop) {
+                    Text(
+                        text = "This freezes the race clock. Undo brings it back.",
+                        color = Dim,
+                        fontSize = 16.sp,
+                    )
+                }
+            }
+            if (state.laps.isNotEmpty()) {
+                Text("Laps", color = Color.White, fontSize = 22.sp)
+                lapLogNewestFirst(state.laps).forEach { lap ->
+                    val pit = lap.pitDurationMs?.let { formatDuration(it) } ?: "—"
+                    Text(
+                        text = "${lap.lapNumber}    ${formatDuration(lap.rideDurationMs)}  /  $pit",
+                        color = Color.White,
+                        fontSize = 20.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+            if (state.raceStartedAtMs != null || state.laps.isNotEmpty()) {
+                Button(
+                    onClick = {
+                        confirmStop = false
+                        if (confirmReset) {
+                            repository.reset()
+                            confirmReset = false
+                        } else {
+                            confirmReset = true
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().height(72.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (confirmReset) Amber else Color(0xFF333333),
+                        contentColor = if (confirmReset) Color.Black else Color.White,
+                    ),
+                ) {
+                    Text(
+                        if (confirmReset) "Tap again to clear the race" else "Reset race",
+                        fontSize = 20.sp,
+                    )
+                }
+                if (confirmReset) {
+                    Text(
+                        text = "This clears the clock and the laps. The beacon setup stays.",
+                        color = Dim,
+                        fontSize = 16.sp,
+                    )
                 }
             }
             state.rejected.lastOrNull()?.let { sighting ->
@@ -215,13 +349,19 @@ private fun BeaconRow(beacon: SeenBeacon, selected: Boolean, onClick: () -> Unit
             .clickable(onClick = onClick)
             .padding(12.dp),
     ) {
+        val title = beacon.name.ifBlank { beacon.mac.ifBlank { "Beacon" } }
         Text(
-            text = "Major ${beacon.major}   Minor ${beacon.minor}   ${beacon.rssi} dBm",
+            text = "$title   ${beacon.rssi} dBm",
             color = Color.White,
             fontSize = 18.sp,
             fontFamily = FontFamily.Monospace,
         )
-        Text(text = beacon.uuid, color = Dim, fontSize = 13.sp)
+        val detail = if (beacon.uuid.isNotBlank()) {
+            "${beacon.uuid}   ${beacon.major} / ${beacon.minor}"
+        } else {
+            beacon.mac
+        }
+        Text(text = detail, color = Dim, fontSize = 13.sp)
     }
 }
 
@@ -237,7 +377,7 @@ fun PermissionScreen(onAllow: () -> Unit, onOpenSettings: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            text = "Pit Lap needs Bluetooth to hear the beacon on the bike.",
+            text = "Pit Lap needs Bluetooth and location. Android hides an iBeacon from an app that does not have location permission.",
             color = Color.White,
             fontSize = 28.sp,
         )
@@ -249,7 +389,7 @@ fun PermissionScreen(onAllow: () -> Unit, onOpenSettings: () -> Unit) {
                 .padding(bottom = 12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Amber, contentColor = Color.Black),
         ) {
-            Text("Allow Bluetooth", fontSize = 22.sp)
+            Text("Allow", fontSize = 22.sp)
         }
         TextButton(onClick = onOpenSettings) {
             Text("Open settings", color = Color.White, fontSize = 18.sp)

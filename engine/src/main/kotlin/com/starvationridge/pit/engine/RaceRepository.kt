@@ -15,24 +15,31 @@ class RaceRepository(private val file: File) {
     private val _state = MutableStateFlow(engine.state)
     private val _seen = MutableStateFlow<List<SeenBeacon>>(emptyList())
     private val _status = MutableStateFlow<String?>(null)
+    private val _notice = MutableStateFlow<String?>(null)
 
     val state: StateFlow<RaceState> = _state.asStateFlow()
     val seen: StateFlow<List<SeenBeacon>> = _seen.asStateFlow()
     val status: StateFlow<String?> = _status.asStateFlow()
+    val notice: StateFlow<String?> = _notice.asStateFlow()
 
     fun start(now: Long) = change { engine.start(now) }
 
     fun tick(now: Long) = change { engine.tick(now) }
 
-    fun manualArrive(now: Long) = change { engine.manualArrive(now) }
+    fun manualArrive(now: Long) = noted { engine.manualArrive(now) }
 
-    fun manualLeave(now: Long) = change { engine.manualLeave(now) }
+    fun manualLeave(now: Long) = noted { engine.manualLeave(now) }
 
-    fun undo(now: Long) = change { engine.undo(now) }
+    fun undo(now: Long) = noted { engine.undo(now) }
 
-    fun selectBeacon(uuid: String, major: Int, minor: Int) {
+    fun finish(now: Long) = noted { engine.finish(now) }
+
+    fun reset() = noted { engine.reset() }
+
+    fun selectBeacon(mac: String, uuid: String, major: Int, minor: Int) {
         engine.updateSettings(
             engine.state.settings.copy(
+                beaconMac = mac,
                 beaconUuid = uuid,
                 beaconMajor = major,
                 beaconMinor = minor,
@@ -57,12 +64,27 @@ class RaceRepository(private val file: File) {
         publish()
     }
 
-    fun noteBeacon(uuid: String, major: Int, minor: Int, rssi: Int, now: Long) {
-        val without = _seen.value.filterNot { it.sameAs(uuid, major, minor) }
-        _seen.value = (without + SeenBeacon(uuid.uppercase(), major, minor, rssi, now))
+    fun noteBeacon(mac: String, name: String, uuid: String, major: Int, minor: Int, rssi: Int, now: Long) {
+        val previous = _seen.value.firstOrNull { it.sameAs(mac, uuid, major, minor) }
+        val keptUuid = uuid.ifBlank { previous?.uuid ?: "" }
+        val keptMajor = if (uuid.isBlank()) previous?.major ?: major else major
+        val keptMinor = if (uuid.isBlank()) previous?.minor ?: minor else minor
+        val keptName = name.ifBlank { previous?.name ?: "" }
+        val without = _seen.value.filterNot { it.sameAs(mac, uuid, major, minor) }
+        _seen.value = (
+            without + SeenBeacon(
+                mac.uppercase(),
+                keptName,
+                keptUuid.uppercase(),
+                keptMajor,
+                keptMinor,
+                rssi,
+                now,
+            )
+            )
             .sortedByDescending { it.rssi }
             .take(12)
-        if (matches(uuid, major, minor)) {
+        if (matches(mac, keptUuid, keptMajor, keptMinor)) {
             change { engine.sample(rssi, now) }
         }
     }
@@ -71,9 +93,13 @@ class RaceRepository(private val file: File) {
         _status.value = message
     }
 
-    fun matches(uuid: String, major: Int, minor: Int): Boolean {
+    fun matches(mac: String, uuid: String, major: Int, minor: Int): Boolean {
         val settings = engine.state.settings
+        if (settings.beaconMac.isNotBlank() && settings.beaconMac.equals(mac, ignoreCase = true)) {
+            return true
+        }
         return settings.beaconUuid.isNotBlank() &&
+            uuid.isNotBlank() &&
             settings.beaconUuid.equals(uuid, ignoreCase = true) &&
             settings.beaconMajor == major &&
             settings.beaconMinor == minor
@@ -83,6 +109,11 @@ class RaceRepository(private val file: File) {
 
     private fun change(block: () -> Unit) {
         block()
+        publish()
+    }
+
+    private fun noted(block: () -> String) {
+        _notice.value = block()
         publish()
     }
 
@@ -121,7 +152,10 @@ class RaceRepository(private val file: File) {
         }
     }
 
-    private fun SeenBeacon.sameAs(uuid: String, major: Int, minor: Int): Boolean {
+    private fun SeenBeacon.sameAs(mac: String, uuid: String, major: Int, minor: Int): Boolean {
+        if (mac.isNotBlank() && this.mac.isNotBlank()) {
+            return this.mac.equals(mac, ignoreCase = true)
+        }
         return this.uuid.equals(uuid, ignoreCase = true) && this.major == major && this.minor == minor
     }
 }

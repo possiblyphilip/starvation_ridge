@@ -13,6 +13,7 @@ data class RaceSettings(
     val exitHoldMs: Long = 15_000L,
     val medianWindowMs: Long = 3_000L,
     val minLapMs: Long = 30L * 60L * 1000L,
+    val beaconMac: String = "",
     val beaconUuid: String = "",
     val beaconMajor: Int = -1,
     val beaconMinor: Int = -1,
@@ -34,15 +35,19 @@ data class RejectedSighting(
 data class RaceState(
     val phase: Phase = Phase.NotStarted,
     val raceStartedAtMs: Long? = null,
+    val raceFinishedAtMs: Long? = null,
     val pitStartedAtMs: Long? = null,
     val rideStartedAtMs: Long? = null,
     val stagingGraceUntilMs: Long? = null,
+    val beaconHeardInPit: Boolean = false,
     val laps: List<LapRecord> = emptyList(),
     val rejected: List<RejectedSighting> = emptyList(),
     val settings: RaceSettings = RaceSettings(),
 )
 
 data class SeenBeacon(
+    val mac: String,
+    val name: String,
     val uuid: String,
     val major: Int,
     val minor: Int,

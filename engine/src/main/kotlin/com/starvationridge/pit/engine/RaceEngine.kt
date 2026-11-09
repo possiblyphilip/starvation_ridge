@@ -15,6 +15,7 @@ class RaceEngine(initial: RaceState = RaceState()) {
 
     private val samples = ArrayDeque<Sample>()
     private var strongSince: Long? = null
+    private var lastStrongAt = 0L
     private var weakSince: Long? = null
     private var rejectLatched = false
     private var dropRequired = false
@@ -28,10 +29,7 @@ class RaceEngine(initial: RaceState = RaceState()) {
         return (now - start).coerceAtLeast(0L)
     }
 
-    fun raceElapsed(now: Long): Long {
-        val start = state.raceStartedAtMs ?: return 0L
-        return (now - start).coerceAtLeast(0L)
-    }
+    fun raceElapsed(now: Long): Long = raceElapsedOf(state, now)
 
     fun start(now: Long) {
         if (state.phase != Phase.NotStarted) return
@@ -46,6 +44,7 @@ class RaceEngine(initial: RaceState = RaceState()) {
                 pitStartedAtMs = now,
                 rideStartedAtMs = null,
                 stagingGraceUntilMs = null,
+                beaconHeardInPit = true,
             )
         } else {
             state.copy(
@@ -57,23 +56,28 @@ class RaceEngine(initial: RaceState = RaceState()) {
             )
         }
         strongSince = null
+        lastStrongAt = 0L
         weakSince = null
         rejectLatched = false
     }
 
     fun sample(rssi: Int, now: Long) {
+        if (state.raceFinishedAtMs != null) return
         samples.addLast(Sample(now, rssi))
         trim(now)
         evaluate(now)
     }
 
     fun tick(now: Long) {
+        if (state.raceFinishedAtMs != null) return
         trim(now)
         evaluate(now)
     }
 
-    fun manualArrive(now: Long) {
-        if (state.phase != Phase.OnCourse) return
+    fun manualArrive(now: Long): String {
+        if (state.raceFinishedAtMs != null) return "Race clock is already stopped"
+        if (state.phase == Phase.NotStarted) return "Start the race first"
+        if (state.phase != Phase.OnCourse) return "Already in the pit. Lap ${displayedLap()}."
         pushUndo()
         val rideStart = state.rideStartedAtMs ?: now
         val lap = LapRecord(
@@ -88,18 +92,40 @@ class RaceEngine(initial: RaceState = RaceState()) {
             rideStartedAtMs = rideStart,
             stagingGraceUntilMs = null,
             laps = state.laps + lap,
+            beaconHeardInPit = freshMedian(now)?.let { it >= state.settings.exitRssi } == true,
         )
         clearPresence()
         dropRequired = false
+        return "Arrived. Pit clock is running on lap ${displayedLap()}."
     }
 
-    fun manualLeave(now: Long) {
-        if (state.phase != Phase.InPit) return
+    fun manualLeave(now: Long): String {
+        if (state.raceFinishedAtMs != null) return "Race clock is already stopped"
+        if (state.phase != Phase.InPit) return "Already out of the pit. Lap ${displayedLap()}."
         leave(now)
+        return "Left. Now on lap ${displayedLap()}. Pit clock stopped."
     }
 
-    fun undo(now: Long) {
-        if (undoStack.isEmpty()) return
+    fun reset(): String {
+        val settings = state.settings
+        state = RaceState(settings = settings)
+        samples.clear()
+        undoStack.clear()
+        clearPresence()
+        dropRequired = false
+        return "Race cleared. Beacon setup kept."
+    }
+
+    fun finish(now: Long): String {
+        if (state.raceStartedAtMs == null) return "Start the race first"
+        if (state.raceFinishedAtMs != null) return "Race clock is already stopped"
+        pushUndo()
+        state = state.copy(raceFinishedAtMs = now)
+        return "Race clock stopped at ${formatDuration(raceElapsed(now))}."
+    }
+
+    fun undo(now: Long): String {
+        if (undoStack.isEmpty()) return "Nothing to undo"
         val prev = undoStack.removeLast()
         val phaseChanged = prev.phase != state.phase
         state = prev.copy(settings = state.settings)
@@ -109,6 +135,7 @@ class RaceEngine(initial: RaceState = RaceState()) {
             dropRequired = true
             dropRequiredSince = now
         }
+        return "Undid the last change. Lap ${displayedLap()}."
     }
 
     fun updateSettings(settings: RaceSettings) {
@@ -142,22 +169,30 @@ class RaceEngine(initial: RaceState = RaceState()) {
                 return
             }
         }
-        if (med != null && med >= state.settings.enterRssi) {
-            touchStrong(now)
+        val rssi = med
+        if (rssi != null && rssi >= state.settings.enterRssi) {
+            val gap = if (lastStrongAt == 0L) Long.MAX_VALUE else now - lastStrongAt
+            val newEpisode = strongSince == null || gap > PRESENCE_MS
+            if (newEpisode) {
+                strongSince = now
+                rejectLatched = false
+            }
+            lastStrongAt = now
             val since = strongSince ?: return
-            if (now - since < state.settings.enterHoldMs) return
+            if (newEpisode || now - since < state.settings.enterHoldMs) return
             val rideStart = state.rideStartedAtMs ?: return
             if (now - rideStart < state.settings.minLapMs) {
                 if (!rejectLatched) {
                     rejectLatched = true
-                    val sighting = RejectedSighting(now, med, "Too soon for another lap")
+                    val sighting = RejectedSighting(now, rssi, "Too soon for another lap")
                     state = state.copy(rejected = (state.rejected + sighting).takeLast(30))
                 }
                 return
             }
             arrive(now)
-        } else {
+        } else if (med != null || lastStrongAt == 0L || now - lastStrongAt > PRESENCE_MS) {
             strongSince = null
+            lastStrongAt = 0L
             rejectLatched = false
         }
     }
@@ -176,6 +211,7 @@ class RaceEngine(initial: RaceState = RaceState()) {
                 pitStartedAtMs = now,
                 rideStartedAtMs = null,
                 stagingGraceUntilMs = null,
+                beaconHeardInPit = true,
             )
             clearPresence()
             return true
@@ -189,6 +225,13 @@ class RaceEngine(initial: RaceState = RaceState()) {
 
     private fun evaluatePit(now: Long, med: Int?) {
         if (med != null && med >= state.settings.exitRssi) {
+            if (!state.beaconHeardInPit) state = state.copy(beaconHeardInPit = true)
+            weakSince = null
+            return
+        }
+        // Silence is not a departure until the beacon has been heard in this pit.
+        // Otherwise a manual Arrived with no beacon ends itself after 15 seconds.
+        if (!state.beaconHeardInPit) {
             weakSince = null
             return
         }
@@ -214,6 +257,7 @@ class RaceEngine(initial: RaceState = RaceState()) {
             phase = Phase.InPit,
             pitStartedAtMs = now,
             stagingGraceUntilMs = null,
+            beaconHeardInPit = true,
             laps = state.laps + lap,
         )
         clearPresence()
@@ -232,18 +276,11 @@ class RaceEngine(initial: RaceState = RaceState()) {
             pitStartedAtMs = null,
             rideStartedAtMs = now,
             stagingGraceUntilMs = null,
+            beaconHeardInPit = false,
             laps = laps,
         )
         clearPresence()
         dropRequired = false
-    }
-
-    private fun touchStrong(now: Long) {
-        val prev = if (samples.size >= 2) samples.elementAt(samples.size - 2).atMs else null
-        if (strongSince == null || prev == null || now - prev > FRESH_MS) {
-            strongSince = now
-            if (prev == null || now - prev > FRESH_MS) rejectLatched = false
-        }
     }
 
     private fun freshMedian(now: Long): Int? {
@@ -262,6 +299,7 @@ class RaceEngine(initial: RaceState = RaceState()) {
 
     private fun clearPresence() {
         strongSince = null
+        lastStrongAt = 0L
         weakSince = null
         rejectLatched = false
     }
@@ -282,6 +320,7 @@ class RaceEngine(initial: RaceState = RaceState()) {
             enterHoldMs = settings.enterHoldMs.coerceAtLeast(0L),
             exitHoldMs = settings.exitHoldMs.coerceAtLeast(0L),
             medianWindowMs = settings.medianWindowMs.coerceAtLeast(1L),
+            beaconMac = settings.beaconMac.uppercase(),
             beaconUuid = settings.beaconUuid.uppercase(),
         )
     }
@@ -290,6 +329,7 @@ class RaceEngine(initial: RaceState = RaceState()) {
 
     companion object {
         const val FRESH_MS = 1_500L
+        const val PRESENCE_MS = 12_000L
         const val STAGING_GRACE_MS = 15_000L
     }
 }

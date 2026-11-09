@@ -1,5 +1,11 @@
 package com.starvationridge.pit.engine
 
+fun raceElapsedOf(state: RaceState, now: Long): Long {
+    val start = state.raceStartedAtMs ?: return 0L
+    val end = state.raceFinishedAtMs ?: now
+    return (end - start).coerceAtLeast(0L)
+}
+
 fun displayedLapOf(state: RaceState): Int {
     if (state.raceStartedAtMs == null) return 0
     return state.laps.count { it.pitDurationMs != null } + 1

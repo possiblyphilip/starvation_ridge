@@ -9,6 +9,7 @@ data class IBeacon(
 
 object IBeaconParser {
     const val APPLE_COMPANY_ID = 0x004C
+    const val KKM_COMPANY_ID = 0x0A53
 
     fun parse(manufacturerId: Int, data: ByteArray): IBeacon? {
         if (manufacturerId != APPLE_COMPANY_ID) return null

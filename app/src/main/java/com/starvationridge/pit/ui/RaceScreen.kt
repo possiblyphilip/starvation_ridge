@@ -34,13 +34,15 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.starvationridge.pit.engine.Phase
 import com.starvationridge.pit.engine.RaceRepository
+import com.starvationridge.pit.engine.LapRecord
 import com.starvationridge.pit.engine.displayedLapOf
 import com.starvationridge.pit.engine.formatDuration
 import com.starvationridge.pit.engine.lapLogNewestFirst
+import com.starvationridge.pit.engine.raceElapsedOf
 import kotlinx.coroutines.delay
 
 private val Ink = Color(0xFF1A1200)
-private val Amber = Color(0xFFFFB300)
+private val Amber = Color(0xFFFF6600)
 private val Dim = Color(0xFF8A8A8A)
 
 @Composable
@@ -56,9 +58,18 @@ fun RaceScreen(repository: RaceRepository, onOpenSettings: () -> Unit) {
     }
     val inPit = state.phase == Phase.InPit
     val pitRunning = inPit && state.pitStartedAtMs != null
+    val clockNow = state.raceFinishedAtMs ?: now
+    val topStart = if (inPit) state.pitStartedAtMs else state.rideStartedAtMs
+    val topElapsed = if (topStart == null) 0L else (clockNow - topStart).coerceAtLeast(0L)
+    val rideStart = state.rideStartedAtMs
+    val waitingForMinLap = state.phase == Phase.OnCourse &&
+        rideStart != null &&
+        now - rideStart < state.settings.minLapMs &&
+        state.rejected.any { it.atMs >= rideStart }
     val hint = when {
         !status.isNullOrBlank() -> status
-        state.settings.beaconUuid.isBlank() -> "Choose the bike beacon in Setup"
+        state.settings.beaconMac.isBlank() && state.settings.beaconUuid.isBlank() -> "Choose the bike beacon in Setup"
+        waitingForMinLap -> "Beacon is here. Next pit opens after the minimum lap."
         else -> null
     }
 
@@ -76,7 +87,7 @@ fun RaceScreen(repository: RaceRepository, onOpenSettings: () -> Unit) {
         ) {
             Column(Modifier.fillMaxSize()) {
                 Text(
-                    text = "PIT",
+                    text = if (inPit) "PIT" else "LAP",
                     color = if (pitRunning) Ink else Dim,
                     fontSize = 18.sp,
                     modifier = Modifier
@@ -85,7 +96,7 @@ fun RaceScreen(repository: RaceRepository, onOpenSettings: () -> Unit) {
                 )
                 Box(Modifier.weight(1f).fillMaxWidth()) {
                     BigNumber(
-                        text = formatDuration(repositoryPit(state.pitStartedAtMs, now)),
+                        text = formatDuration(topElapsed),
                         color = if (pitRunning) Ink else Color.White,
                         digits = 7,
                     )
@@ -136,10 +147,12 @@ fun RaceScreen(repository: RaceRepository, onOpenSettings: () -> Unit) {
                 .fillMaxWidth()
                 .background(Color.Black),
         ) {
-            when (state.phase) {
-                Phase.NotStarted -> StartBand(onStart = { repository.start(System.currentTimeMillis()) })
-                Phase.OnCourse -> RaceClock(formatDuration(now - (state.raceStartedAtMs ?: now)))
-                Phase.InPit -> LapLog(repository)
+            val raceTime = formatDuration(raceElapsedOf(state, now))
+            when {
+                state.phase == Phase.NotStarted -> StartBand(onStart = { repository.start(System.currentTimeMillis()) })
+                state.raceFinishedAtMs != null -> FinishBand(raceTime, state.laps)
+                state.phase == Phase.OnCourse -> RaceClock(raceTime, "RACE")
+                else -> LapLog(repository)
             }
         }
     }
@@ -174,11 +187,11 @@ private fun StartBand(onStart: () -> Unit) {
 }
 
 @Composable
-private fun RaceClock(text: String) {
+private fun RaceClock(text: String, label: String) {
     Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
         Text(
-            text = "RACE",
-            color = Dim,
+            text = label,
+            color = if (label == "FINISH") Amber else Dim,
             fontSize = 18.sp,
             modifier = Modifier.padding(top = 12.dp),
         )
@@ -189,10 +202,32 @@ private fun RaceClock(text: String) {
 }
 
 @Composable
+private fun FinishBand(raceTime: String, laps: List<LapRecord>) {
+    Column(Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier.weight(if (laps.isEmpty()) 1f else 0.45f).fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = "FINISH",
+                color = Amber,
+                fontSize = 18.sp,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                BigNumber(text = raceTime, color = Color.White, digits = 7)
+            }
+        }
+        if (laps.isNotEmpty()) {
+            LapRows(laps, Modifier.weight(0.55f).fillMaxWidth())
+        }
+    }
+}
+
+@Composable
 private fun LapLog(repository: RaceRepository) {
     val state by repository.state.collectAsStateWithLifecycle()
-    val rows = lapLogNewestFirst(state.laps)
-    Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+    Column(Modifier.fillMaxSize()) {
         Text(
             text = "RIDE / PIT",
             color = Dim,
@@ -201,32 +236,38 @@ private fun LapLog(repository: RaceRepository) {
                 .align(Alignment.CenterHorizontally)
                 .padding(top = 12.dp, bottom = 8.dp),
         )
-        if (rows.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No laps yet", color = Dim, fontSize = 28.sp)
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(bottom = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                items(rows, key = { "${it.lapNumber}-${it.arrivedAtMs}" }) { lap ->
-                    val pit = lap.pitDurationMs?.let { formatDuration(it) } ?: "—"
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(
-                            text = lap.lapNumber.toString(),
-                            color = Dim,
-                            fontSize = 28.sp,
-                            fontFamily = FontFamily.Monospace,
-                        )
-                        Text(
-                            text = "${formatDuration(lap.rideDurationMs)}  /  $pit",
-                            color = Color.White,
-                            fontSize = 28.sp,
-                            fontFamily = FontFamily.Monospace,
-                        )
-                    }
+        LapRows(state.laps, Modifier.weight(1f).fillMaxWidth())
+    }
+}
+
+@Composable
+private fun LapRows(laps: List<LapRecord>, modifier: Modifier) {
+    val rows = lapLogNewestFirst(laps)
+    if (rows.isEmpty()) {
+        Box(modifier, contentAlignment = Alignment.Center) {
+            Text("No laps yet", color = Dim, fontSize = 28.sp)
+        }
+    } else {
+        LazyColumn(
+            modifier = modifier.padding(horizontal = 20.dp),
+            contentPadding = PaddingValues(bottom = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            items(rows, key = { "${it.lapNumber}-${it.arrivedAtMs}" }) { lap ->
+                val pit = lap.pitDurationMs?.let { formatDuration(it) } ?: "—"
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(
+                        text = lap.lapNumber.toString(),
+                        color = Dim,
+                        fontSize = 28.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Text(
+                        text = "${formatDuration(lap.rideDurationMs)}  /  $pit",
+                        color = Color.White,
+                        fontSize = 28.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
                 }
             }
         }
@@ -248,9 +289,4 @@ private fun BigNumber(text: String, color: Color, digits: Int) {
             textAlign = TextAlign.Center,
         )
     }
-}
-
-private fun repositoryPit(pitStartedAtMs: Long?, now: Long): Long {
-    val start = pitStartedAtMs ?: return 0L
-    return (now - start).coerceAtLeast(0L)
 }

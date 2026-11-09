@@ -9,9 +9,11 @@ object RaceJson {
         root.put("version", 1)
         root.put("phase", state.phase.name)
         root.put("raceStartedAtMs", state.raceStartedAtMs ?: JSONObject.NULL)
+        root.put("raceFinishedAtMs", state.raceFinishedAtMs ?: JSONObject.NULL)
         root.put("pitStartedAtMs", state.pitStartedAtMs ?: JSONObject.NULL)
         root.put("rideStartedAtMs", state.rideStartedAtMs ?: JSONObject.NULL)
         root.put("stagingGraceUntilMs", state.stagingGraceUntilMs ?: JSONObject.NULL)
+        root.put("beaconHeardInPit", state.beaconHeardInPit)
         root.put("laps", JSONArray().apply {
             state.laps.forEach { lap ->
                 put(JSONObject().apply {
@@ -68,9 +70,11 @@ object RaceJson {
         return RaceState(
             phase = Phase.valueOf(root.optString("phase", Phase.NotStarted.name)),
             raceStartedAtMs = optionalLong(root, "raceStartedAtMs"),
+            raceFinishedAtMs = optionalLong(root, "raceFinishedAtMs"),
             pitStartedAtMs = optionalLong(root, "pitStartedAtMs"),
             rideStartedAtMs = optionalLong(root, "rideStartedAtMs"),
             stagingGraceUntilMs = optionalLong(root, "stagingGraceUntilMs"),
+            beaconHeardInPit = root.optBoolean("beaconHeardInPit", false),
             laps = laps,
             rejected = rejected,
             settings = decodeSettings(root.optJSONObject("settings")),
@@ -85,6 +89,7 @@ object RaceJson {
             put("exitHoldMs", settings.exitHoldMs)
             put("medianWindowMs", settings.medianWindowMs)
             put("minLapMs", settings.minLapMs)
+            put("beaconMac", settings.beaconMac)
             put("beaconUuid", settings.beaconUuid)
             put("beaconMajor", settings.beaconMajor)
             put("beaconMinor", settings.beaconMinor)
@@ -101,6 +106,7 @@ object RaceJson {
             exitHoldMs = json.optLong("exitHoldMs", defaults.exitHoldMs),
             medianWindowMs = json.optLong("medianWindowMs", defaults.medianWindowMs),
             minLapMs = json.optLong("minLapMs", defaults.minLapMs),
+            beaconMac = json.optString("beaconMac", ""),
             beaconUuid = json.optString("beaconUuid", ""),
             beaconMajor = json.optInt("beaconMajor", -1),
             beaconMinor = json.optInt("beaconMinor", -1),
